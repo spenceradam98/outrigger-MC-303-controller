@@ -1,13 +1,17 @@
 # Outrigger (working name)
 
 A VST3 and standalone plugin that drives a Roland MC-303 Groovebox as an external sound module.
+It comes in two builds: **Outrigger** for instrument slots and **Outrigger FX** for effect slots.
 
-- **MIDI out:** sends the rhythm part on ch 10 and parts 1–7 on ch 1–7.
+- **MIDI out:** sends the rhythm part on ch 10 and parts 1–7 on ch 1–7, or 16 parts in
+  Sound Module mode.
+- **MIDI in (optional):** the plugin follows the unit's own knob moves.
 - **Sound control per part:** program, mix, filter, envelope, vibrato, pitch and effects.
 - **Audio return:** brings the unit's audio back from your interface with meters and latency
   compensation.
 
-See `docs/DESIGN.md` for the plan, the MIDI confirmation table and host notes. Roland and
+See `docs/DESIGN.md` for the plan, the MIDI confirmation table and the Max Sample hosting
+notes. Roland and
 MC-303 are trademarks of Roland Corporation, used only to describe compatibility.
 
 ## Build
@@ -28,4 +32,5 @@ X11 dev packages.
 - `Source/engine` is plain C++: the protocol table, part sync with a MIDI bandwidth budget,
   routing, clock, meters and the latency probe. Its tests are in `tests/`.
 - `Source/plugin` holds the JUCE wrapper, the shared MIDI-port hub, the UI and the 4 themes.
-- `tools/Snapshot.cpp` renders UI screenshots. Build it with `-DOUTRIGGER_BUILD_SNAPSHOT=ON`.
+- `tools/Snapshot.cpp` renders UI screenshots and smoke-tests the processor and the built
+  VST3s. Build it with `-DOUTRIGGER_BUILD_SNAPSHOT=ON`.
