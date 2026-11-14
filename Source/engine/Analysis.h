@@ -25,31 +25,37 @@ private:
     bool clip = false;
 };
 
-// Sends a drum hit, then watches the return for its onset.
-// Result = samples from the hit's scheduled MIDI time to the onset in the return audio.
+// Sends a few drum hits, watching the return for each onset.
+// Result = median samples from a hit's scheduled MIDI time to its onset in the return audio.
 class LatencyProbe
 {
 public:
     enum class State { Idle, Waiting, Done, TimedOut };
+    static constexpr int kMaxPings = 8;
 
     void prepare (double sampleRate) { sr = sampleRate; state = State::Idle; }
-    void start (int channel, int note) { ch = channel; nt = note; state = State::Waiting; sendPending = true; }
+    void start (int channel, int note, int pings = 3);
 
-    // Call once per block. Emits the ping note at offset 0, its note-off later, and
-    // analyses the return audio (input channels after trim).
+    // Call once per block. Emits the ping notes and analyses the return audio.
     void process (const float* const* in, int numChannels, int numSamples, EventList& out);
 
     State getState() const { return state; }
     int resultSamples() const { return result; }
+    int successfulPings() const { return numResults; }
+    int spreadSamples() const { return spread; }   // max - min of the successful pings
     void setThreshold (float linear) { threshold = linear; }
 
 private:
+    enum class Phase { Quiet, Armed, Listening, Gap };
+    void finish();
+
     double sr = 48000.0;
     State state = State::Idle;
-    int ch = 9, nt = 37;
-    bool sendPending = false, noteOffPending = false;
-    int64_t elapsed = 0, noteOffAt = 0;
-    int result = 0;
+    Phase phase = Phase::Quiet;
+    int ch = 9, nt = 37, pingsWanted = 3, pingsDone = 0;
+    int64_t elapsed = 0, noteOffAt = -1, phaseEnd = 0, pingSentAt = 0;
+    int results[kMaxPings] {};
+    int numResults = 0, result = 0, spread = 0;
     float threshold = 0.03f;     // about -30 dBFS
     float noiseFloor = 0.0f;
 };

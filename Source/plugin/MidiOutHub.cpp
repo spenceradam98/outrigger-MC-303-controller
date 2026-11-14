@@ -25,6 +25,49 @@ std::shared_ptr<MidiOutHub::Port> MidiOutHub::acquire (const juce::String& ident
     return p;
 }
 
+std::shared_ptr<MidiOutHub::InPort> MidiOutHub::acquireInput (const juce::String& identifier)
+{
+    if (identifier.isEmpty()) return {};
+    const juce::ScopedLock sl (lock);
+    if (auto existing = inPorts[identifier].lock()) return existing;
+
+    auto p = std::make_shared<InPort>();
+    p->input = juce::MidiInput::openDevice (identifier, p.get());
+    if (p->input == nullptr) return {};
+    p->identifier = identifier;
+    p->name = p->input->getName();
+    p->input->start();
+    inPorts[identifier] = p;
+    return p;
+}
+
+void MidiOutHub::InPort::addSink (const std::shared_ptr<UnitSink>& s)
+{
+    const juce::ScopedLock sl (sinkLock);
+    sinks.push_back (s);
+}
+
+void MidiOutHub::InPort::removeSink (const std::shared_ptr<UnitSink>& s)
+{
+    const juce::ScopedLock sl (sinkLock);
+    sinks.erase (std::remove_if (sinks.begin(), sinks.end(),
+                                 [&] (const std::weak_ptr<UnitSink>& w) { auto x = w.lock(); return x == nullptr || x == s; }),
+                 sinks.end());
+}
+
+void MidiOutHub::InPort::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& m)
+{
+    // Channel messages only; clock, active sensing and SysEx from the unit are ignored.
+    const int size = m.getRawDataSize();
+    if (size < 1 || size > 3 || m.getRawData()[0] >= 0xF0) return;
+    UnitSink::Msg msg;
+    msg.size = (uint8_t) size;
+    std::memcpy (msg.bytes, m.getRawData(), (size_t) size);
+    const juce::ScopedLock sl (sinkLock);
+    for (auto& w : sinks)
+        if (auto s = w.lock()) { s->audio.push (msg); s->message.push (msg); }
+}
+
 MidiSender::MidiSender() : juce::Thread ("Outrigger MIDI out")
 {
     pending.reserve (kSize);

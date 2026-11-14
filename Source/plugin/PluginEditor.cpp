@@ -2,11 +2,56 @@
 
 namespace outrigger
 {
-static constexpr int kWidth = 1180, kHeight = 690, kSideWidth = 286;
+static constexpr int kWidth = 1180, kHeight = 760, kSideWidth = 286;
 
 static juce::String noteName (int n)
 {
     return juce::String (n) + "  " + juce::MidiMessage::getMidiNoteName (n, true, true, 4);
+}
+
+// ------------------------------------------------------------------ NameTable
+juce::File NameTable::folder()
+{
+    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory).getChildFile ("Outrigger");
+}
+
+void NameTable::load()
+{
+    tones.clear();
+    rhythms.clear();
+    auto parse = [] (const juce::File& f, bool rhythm, std::map<std::pair<int, int>, juce::String>& into) {
+        juce::StringArray lines;
+        f.readLines (lines);
+        for (auto line : lines)
+        {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWithChar ('#')) continue;
+            juce::StringArray cols;
+            cols.addTokens (line, ",", "\"");
+            if (cols.size() < (rhythm ? 2 : 3)) continue;
+            const int a = cols[0].trim().getIntValue();
+            if (rhythm) into[{ -1, a }] = cols[1].trim().unquoted();
+            else into[{ a, cols[1].trim().getIntValue() }] = cols[2].trim().unquoted();
+        }
+    };
+    parse (folder().getChildFile ("tones.csv"), false, tones);
+    parse (folder().getChildFile ("rhythm.csv"), true, rhythms);
+}
+
+void NameTable::writeTemplatesIfMissing() const
+{
+    folder().createDirectory();
+    auto t = folder().getChildFile ("tones.csv");
+    if (! t.existsAsFile())
+        t.replaceWithText ("# Outrigger tone names: bank,program,name  (bank = CC0 value, program 1-128 as on the unit)\n"
+                           "# Fill this in from the tone list in the owner's manual. Example line:\n"
+                           "# 64,10,My Bass\n");
+    auto r = folder().getChildFile ("rhythm.csv");
+    if (! r.existsAsFile())
+        r.replaceWithText ("# Outrigger rhythm-set names: program,name  (program 1-128 as on the unit)\n"
+                           "# Example line:\n"
+                           "# 41,My House Kit\n");
+    folder().getChildFile ("Setups").createDirectory();
 }
 
 // ------------------------------------------------------------------ Knob
@@ -92,10 +137,15 @@ static void setupIncDec (juce::Slider& s)
     s.setIncDecButtonsMode (juce::Slider::incDecButtonsDraggable_Vertical);
 }
 
-PartStrip::PartStrip (OutriggerProcessor& p, int partIndex, std::function<void (int)> onSelect) : part (partIndex)
+PartStrip::PartStrip (OutriggerProcessor& p, int partIndex, std::function<void (int)> onSelect, const NameTable& nameTable)
+    : proc (p), names (nameTable), part (partIndex)
 {
     auto& s = p.apvts;
     select.setButtonText (part == kRhythmPart ? "R  Rhythm" : "Part " + partName (part));
+    nameLabel.setFont (juce::FontOptions (10.5f));
+    nameLabel.setJustificationType (juce::Justification::centred);
+    nameLabel.setMinimumHorizontalScale (0.7f);
+    addAndMakeVisible (nameLabel);
     select.setClickingTogglesState (false);
     select.onClick = [this, onSelect] { onSelect (part); };
     addAndMakeVisible (select);
@@ -109,6 +159,7 @@ PartStrip::PartStrip (OutriggerProcessor& p, int partIndex, std::function<void (
     program.textFromValueFunction = [] (double v) { return juce::String ((int) v + 1); };
     program.valueFromTextFunction = [] (const juce::String& t) { return (double) (t.getIntValue() - 1); };
     program.updateText();
+    program.onValueChange = [this] { refreshName(); };
     chLabel.setText ("Ch", juce::dontSendNotification);
     pcLabel.setText (part == kRhythmPart ? "Set" : "PC", juce::dontSendNotification);
     for (auto* l : { &chLabel, &pcLabel }) { l->setFont (juce::FontOptions (11.0f)); addAndMakeVisible (*l); }
@@ -127,11 +178,20 @@ PartStrip::PartStrip (OutriggerProcessor& p, int partIndex, std::function<void (
     volA = std::make_unique<SliderAttachment> (s, paramId (part, "vol"), volume);
 }
 
-void PartStrip::setActivity (bool a)
+void PartStrip::setActivity (bool a, bool fromUnit)
 {
-    const float before = led;
+    const float before = led + unitLed;
     led = a ? 1.0f : led * 0.8f;
-    if (std::abs (led - before) > 0.01f) repaint();
+    unitLed = fromUnit ? 1.0f : unitLed * 0.8f;
+    if (std::abs (led + unitLed - before) > 0.01f) repaint();
+}
+
+void PartStrip::refreshName()
+{
+    const int prog = (int) program.getValue() + 1;
+    const auto n = part == kRhythmPart ? names.rhythm (prog)
+                                       : names.tone ((int) proc.apvts.getRawParameterValue (paramId (part, "bank"))->load(), prog);
+    nameLabel.setText (n, juce::dontSendNotification);
 }
 
 void PartStrip::paint (juce::Graphics& g)
@@ -146,6 +206,9 @@ void PartStrip::paint (juce::Graphics& g)
     auto ledR = juce::Rectangle<float> (r.getRight() - 16.0f, r.getY() + 37.0f, 9.0f, 9.0f);
     g.setColour (th.ledOff.interpolatedWith (th.accentAlt, led));
     g.fillEllipse (ledR);
+    // second LED: MIDI coming back from the unit on this part
+    g.setColour (th.ledOff.interpolatedWith (th.accent, unitLed));
+    g.fillEllipse (ledR.translated (-13.0f, 0.0f));
 }
 
 void PartStrip::resized()
@@ -153,7 +216,7 @@ void PartStrip::resized()
     auto r = getLocalBounds().reduced (8, 8);
     select.setBounds (r.removeFromTop (24));
     r.removeFromTop (4);
-    on.setBounds (r.removeFromTop (20).withTrimmedRight (20));
+    on.setBounds (r.removeFromTop (20).withTrimmedRight (32));
     r.removeFromTop (4);
     auto row = r.removeFromTop (22);
     chLabel.setBounds (row.removeFromLeft (26));
@@ -162,7 +225,7 @@ void PartStrip::resized()
     row = r.removeFromTop (22);
     pcLabel.setBounds (row.removeFromLeft (26));
     program.setBounds (row);
-    r.removeFromTop (8);
+    nameLabel.setBounds (r.removeFromTop (16));
     volume.setBounds (r.removeFromLeft (34));
     r.removeFromLeft (4);
     const int kh = r.getHeight() / 3;
@@ -179,7 +242,10 @@ OutriggerEditor::OutriggerEditor (OutriggerProcessor& p) : juce::AudioProcessorE
 
     title.setText ("OUTRIGGER", juce::dontSendNotification);
     title.setFont (juce::FontOptions (24.0f, juce::Font::bold));
-    subtitle.setText ("hardware groovebox bridge  |  8 parts out, stereo return in", juce::dontSendNotification);
+    subtitle.setText (OutriggerProcessor::isEffectVariant() ? "FX version  |  hardware groovebox bridge" : "hardware groovebox bridge  |  parts out, stereo return in",
+                      juce::dontSendNotification);
+    names.writeTemplatesIfMissing();
+    names.load();
     subtitle.setFont (juce::FontOptions (12.0f));
     addAndMakeVisible (title);
     addAndMakeVisible (subtitle);
@@ -203,6 +269,59 @@ OutriggerEditor::OutriggerEditor (OutriggerProcessor& p) : juce::AudioProcessorE
     addAndMakeVisible (rescan);
     deviceStatus.setFont (juce::FontOptions (11.0f));
     addAndMakeVisible (deviceStatus);
+    inputBox.onChange = [this] {
+        const int idx = inputBox.getSelectedId() - 2;
+        proc.setUnitInputDevice (juce::isPositiveAndBelow (idx, inputIds.size()) ? inputIds[idx] : juce::String());
+    };
+    inputBox.setTooltip ("MIDI coming back from the unit: its knob moves update these controls");
+    addAndMakeVisible (inputBox);
+    setupBox.setTextWhenNothingSelected ("Setups...");
+    setupBox.onChange = [this] {
+        const int id = setupBox.getSelectedId();
+        if (id == 1)
+        {
+            juce::ValueTree init ("OutriggerSetup");
+            for (auto* prm : proc.getParameters())
+                if (auto* r = dynamic_cast<juce::RangedAudioParameter*> (prm))
+                {
+                    juce::ValueTree v ("Param");
+                    v.setProperty ("id", r->getParameterID(), nullptr);
+                    v.setProperty ("value", r->convertFrom0to1 (r->getDefaultValue()), nullptr);
+                    init.appendChild (v, nullptr);
+                }
+            proc.applySetup (init);
+        }
+        else if (juce::isPositiveAndBelow (id - 2, setupFiles.size()))
+        {
+            if (auto xml = juce::XmlDocument::parse (setupFiles[id - 2]))
+                proc.applySetup (juce::ValueTree::fromXml (*xml));
+        }
+        loadDrumNote();
+        for (auto* st : strips) st->refreshName();
+    };
+    addAndMakeVisible (setupBox);
+    saveSetupBtn.onClick = [this] { saveSetup(); };
+    addAndMakeVisible (saveSetupBtn);
+    namesBtn.setTooltip ("Tone and rhythm-set names: edit tones.csv / rhythm.csv in Documents/Outrigger, then click to reload");
+    namesBtn.onClick = [this] {
+        names.writeTemplatesIfMissing();
+        names.load();
+        for (auto* st : strips) st->refreshName();
+        if (names.count() == 0) NameTable::folder().revealToUser();
+    };
+    addAndMakeVisible (namesBtn);
+    warning.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+    addAndMakeVisible (warning);
+    for (auto* b : { &page1, &page2 })
+    {
+        b->setClickingTogglesState (false);
+        addChildComponent (*b);
+    }
+    page1.onClick = [this] { setPage (0); };
+    page2.onClick = [this] { setPage (1); };
+    bankName.setFont (juce::FontOptions (11.0f));
+    addAndMakeVisible (bankName);
+
     sendAll.onClick = [this] { proc.requestSendAll(); };
     sendAll.setTooltip ("Resend every part setting to the unit");
     panic.onClick = [this] { proc.requestPanic(); };
@@ -210,7 +329,7 @@ OutriggerEditor::OutriggerEditor (OutriggerProcessor& p) : juce::AudioProcessorE
     addAndMakeVisible (panic);
 
     for (int i = 0; i < kNumParts; ++i)
-        addAndMakeVisible (strips.add (new PartStrip (proc, i, [this] (int part) { selectPart (part); })));
+        addChildComponent (strips.add (new PartStrip (proc, i, [this] (int part) { selectPart (part); }, names)));
 
     // detail panel
     detailTitle.setFont (juce::FontOptions (15.0f, juce::Font::bold));
@@ -286,6 +405,7 @@ OutriggerEditor::OutriggerEditor (OutriggerProcessor& p) : juce::AudioProcessorE
     addAndMakeVisible (latencyMs);
     measure.setTooltip ("Plays a side stick on the rhythm part and times its arrival on the return input");
     measure.onClick = [this] { measuring = true; proc.startLatencyMeasure (37); };
+    measure.setTooltip ("Plays 3 side-stick hits on the rhythm part and times their arrival on the return input (median)");
     addAndMakeVisible (measure);
 
     // effects
@@ -321,6 +441,13 @@ OutriggerEditor::OutriggerEditor (OutriggerProcessor& p) : juce::AudioProcessorE
     // routing
     routeBox.addItemList ({ "Passthrough", "Focus part" }, 1);
     for (int i = 0; i < kNumParts; ++i) focusBox.addItem ("Part " + partName (i), i + 1);
+    for (auto* b : { &moduleBtn, &followBtn, &thruBtn }) addAndMakeVisible (*b);
+    moduleA = std::make_unique<ButtonAttachment> (s, "module_mode", moduleBtn);
+    followA = std::make_unique<ButtonAttachment> (s, "unit_follow", followBtn);
+    thruA = std::make_unique<ButtonAttachment> (s, "unit_thru", thruBtn);
+    moduleBtn.setTooltip ("Hold PLAY MODE while powering on the unit to enter Sound Module mode: 16 parts, rhythm on part 10");
+    moduleBtn.onStateChange = [this] { if (! moduleBtn.getToggleState() && page != 0) setPage (0); else resized(); };
+    thruBtn.setTooltip ("Pass MIDI from the unit to the host's MIDI input of this plugin's track (host must accept plugin MIDI out)");
     routeA = std::make_unique<ComboAttachment> (s, "route", routeBox);
     focusA = std::make_unique<ComboAttachment> (s, "focus", focusBox);
     routeBox.setTooltip ("Passthrough keeps the DAW's MIDI channels. Focus sends everything to one part.");
@@ -328,6 +455,7 @@ OutriggerEditor::OutriggerEditor (OutriggerProcessor& p) : juce::AudioProcessorE
     clockA = std::make_unique<ButtonAttachment> (s, "clock", clockBtn);
 
     refreshDevices();
+    refreshSetups();
     themeBox.setSelectedId (proc.getThemeIndex() + 1, juce::dontSendNotification);
     applyTheme (proc.getThemeIndex());
     selectPart (1);
@@ -360,7 +488,7 @@ void OutriggerEditor::refreshDevices()
 {
     deviceBox.clear (juce::dontSendNotification);
     deviceIds.clear();
-    deviceBox.addItem ("(no direct device)", 1);
+    deviceBox.addItem ("MIDI to unit: (none)", 1);
     int selected = 1;
     for (auto& d : juce::MidiOutput::getAvailableDevices())
     {
@@ -369,11 +497,61 @@ void OutriggerEditor::refreshDevices()
         if (d.identifier == proc.getDirectDeviceId()) selected = deviceIds.size() + 1;
     }
     deviceBox.setSelectedId (selected, juce::dontSendNotification);
+
+    inputBox.clear (juce::dontSendNotification);
+    inputIds.clear();
+    inputBox.addItem ("MIDI from unit: (none)", 1);
+    selected = 1;
+    for (auto& d : juce::MidiInput::getAvailableDevices())
+    {
+        inputIds.add (d.identifier);
+        inputBox.addItem (d.name, inputIds.size() + 1);
+        if (d.identifier == proc.getUnitInputId()) selected = inputIds.size() + 1;
+    }
+    inputBox.setSelectedId (selected, juce::dontSendNotification);
+}
+
+void OutriggerEditor::refreshSetups()
+{
+    setupBox.clear (juce::dontSendNotification);
+    setupFiles.clear();
+    setupBox.addItem ("Init (all defaults)", 1);
+    auto dir = NameTable::folder().getChildFile ("Setups");
+    for (auto& f : dir.findChildFiles (juce::File::findFiles, false, "*.outrigger"))
+        setupFiles.add (f);
+    setupFiles.sort();
+    for (int i = 0; i < setupFiles.size(); ++i) setupBox.addItem (setupFiles[i].getFileNameWithoutExtension(), i + 2);
+}
+
+void OutriggerEditor::saveSetup()
+{
+    auto dir = NameTable::folder().getChildFile ("Setups");
+    dir.createDirectory();
+    chooser = std::make_unique<juce::FileChooser> ("Save setup", dir.getChildFile ("My setup.outrigger"), "*.outrigger");
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
+                          [this] (const juce::FileChooser& fc) {
+                              auto f = fc.getResult();
+                              if (f == juce::File()) return;
+                              f = f.withFileExtension ("outrigger");
+                              if (auto xml = proc.createSetup().createXml()) xml->writeTo (f);
+                              refreshSetups();
+                          });
+}
+
+void OutriggerEditor::setPage (int newPage)
+{
+    page = newPage;
+    page1.setToggleState (page == 0, juce::dontSendNotification);
+    page2.setToggleState (page == 1, juce::dontSendNotification);
+    if ((selectedPart >= kNormalParts) != (page == 1)) selectPart (page == 1 ? kNormalParts : 1);
+    resized();
 }
 
 void OutriggerEditor::selectPart (int p)
 {
+    if (p >= proc.activeParts()) p = 1;
     selectedPart = p;
+    page = p >= kNormalParts ? 1 : 0;
     for (int i = 0; i < strips.size(); ++i) strips[i]->setSelected (i == p);
     auto& s = proc.apvts;
     const bool rhythm = p == kRhythmPart;
@@ -401,6 +579,7 @@ void OutriggerEditor::selectPart (int p)
         c->setVisible (rhythm);
     for (auto& k : drumKnobs) k->setVisible (rhythm);
     if (rhythm) loadDrumNote();
+    bankName.setVisible (! rhythm);
     resized();
 }
 
@@ -430,6 +609,8 @@ void OutriggerEditor::paint (juce::Graphics& g)
     g.setColour (th.accent);
     g.fillRect (headerArea.removeFromBottom (2));
 
+    g.setColour (th.panel.darker (0.15f));
+    g.fillRect (footerArea);
     for (auto r : { detailArea, sideArea })
     {
         g.setColour (th.panel);
@@ -442,67 +623,103 @@ void OutriggerEditor::paint (juce::Graphics& g)
 void OutriggerEditor::resized()
 {
     auto r = getLocalBounds();
-    headerArea = r.removeFromTop (58);
+    headerArea = r.removeFromTop (88);
+    footerArea = r.removeFromBottom (24);
     {
         auto h = headerArea.reduced (12, 8);
-        auto left = h.removeFromLeft (360);
-        title.setBounds (left.removeFromTop (26));
-        subtitle.setBounds (left);
-        panic.setBounds (h.removeFromRight (64).withSizeKeepingCentre (64, 26));
-        h.removeFromRight (6);
-        sendAll.setBounds (h.removeFromRight (80).withSizeKeepingCentre (80, 26));
-        h.removeFromRight (12);
-        themeBox.setBounds (h.removeFromRight (120).withSizeKeepingCentre (120, 26));
-        h.removeFromRight (12);
-        auto top = h.removeFromTop (26);
-        outputModeBox.setBounds (top.removeFromLeft (140));
-        top.removeFromLeft (6);
-        rescan.setBounds (top.removeFromRight (64));
-        top.removeFromRight (6);
-        deviceBox.setBounds (top);
-        deviceStatus.setBounds (h);
+        auto left = h.removeFromLeft (330);
+        title.setBounds (left.removeFromTop (30));
+        subtitle.setBounds (left.removeFromTop (18));
+        auto row1 = h.removeFromTop (30).reduced (0, 2);
+        h.removeFromTop (6);
+        auto row2 = h.removeFromTop (30).reduced (0, 2);
+
+        panic.setBounds (row1.removeFromRight (64));
+        row1.removeFromRight (6);
+        sendAll.setBounds (row1.removeFromRight (80));
+        row1.removeFromRight (12);
+        themeBox.setBounds (row1.removeFromRight (120));
+        row1.removeFromRight (12);
+        outputModeBox.setBounds (row1.removeFromLeft (140));
+        row1.removeFromLeft (6);
+        rescan.setBounds (row1.removeFromRight (64));
+        row1.removeFromRight (6);
+        deviceBox.setBounds (row1);
+
+        namesBtn.setBounds (row2.removeFromRight (64));
+        row2.removeFromRight (6);
+        saveSetupBtn.setBounds (row2.removeFromRight (94));
+        row2.removeFromRight (6);
+        setupBox.setBounds (row2.removeFromRight (180));
+        row2.removeFromRight (12);
+        inputBox.setBounds (row2);
+    }
+    {
+        auto f = footerArea.reduced (12, 2);
+        warning.setBounds (f.removeFromRight (f.getWidth() / 2));
+        deviceStatus.setBounds (f);
     }
 
-    r.reduce (8, 8);
+    r.reduce (8, 4);
     sideArea = r.removeFromRight (kSideWidth);
     r.removeFromRight (8);
-    mixerArea = r.removeFromTop (juce::jmax (300, r.getHeight() / 2));
+    const bool module = proc.activeParts() > kNormalParts;
+    page1.setVisible (module);
+    page2.setVisible (module);
+    if (module)
+    {
+        auto tabs = r.removeFromTop (24);
+        page1.setBounds (tabs.removeFromLeft (120));
+        tabs.removeFromLeft (4);
+        page2.setBounds (tabs.removeFromLeft (120));
+        r.removeFromTop (4);
+    }
+    else page = 0;
+    page1.setToggleState (page == 0, juce::dontSendNotification);
+    page2.setToggleState (page == 1, juce::dontSendNotification);
+
+    mixerArea = r.removeFromTop (juce::jmax (310, r.getHeight() / 2));
     r.removeFromTop (8);
     detailArea = r;
 
-    const int sw = mixerArea.getWidth() / kNumParts;
+    const int sw = mixerArea.getWidth() / kNormalParts;
     auto m = mixerArea;
-    for (auto* s : strips) s->setBounds (m.removeFromLeft (sw));
+    for (int i = 0; i < strips.size(); ++i)
+    {
+        const bool show = (i / kNormalParts) == page;
+        strips[i]->setVisible (show);
+        if (show) strips[i]->setBounds (m.removeFromLeft (sw));
+    }
 
     layoutDetail (detailArea.reduced (12, 8));
 
     // side column
     auto sd = sideArea.reduced (12, 10);
     returnLabel.setBounds (sd.removeFromTop (20));
-    auto ret = sd.removeFromTop (160);
+    auto ret = sd.removeFromTop (150);
     meter.setBounds (ret.removeFromLeft (44));
     ret.removeFromLeft (10);
-    auto knobs = ret.removeFromTop (100);
+    auto knobs = ret.removeFromTop (96);
     trim.setBounds (knobs.removeFromLeft (knobs.getWidth() / 2));
     out.setBounds (knobs);
-    ret.removeFromTop (6);
+    ret.removeFromTop (4);
     monitorBtn.setBounds (ret.removeFromTop (22));
     monoSumBtn.setBounds (ret.removeFromTop (22));
-    sd.removeFromTop (8);
+    sd.removeFromTop (6);
     latencyLabel.setBounds (sd.removeFromTop (18));
     auto lat = sd.removeFromTop (26);
     measure.setBounds (lat.removeFromRight (76));
     lat.removeFromRight (6);
     latencyMs.setBounds (lat);
 
-    sd.removeFromTop (12);
+    sd.removeFromTop (10);
     fxLabel.setBounds (sd.removeFromTop (20));
     auto fxRow = sd.removeFromTop (24);
     revType.setBounds (fxRow.removeFromLeft (fxRow.getWidth() / 2 - 3));
     fxRow.removeFromLeft (6);
     choType.setBounds (fxRow);
     sd.removeFromTop (4);
-    auto lv = sd.removeFromTop (78);
+    auto lv = sd.removeFromTop (72);
     revLevel.setBounds (lv.removeFromLeft (lv.getWidth() / 2));
     choLevel.setBounds (lv);
     experimental.setBounds (sd.removeFromTop (22));
@@ -510,14 +727,14 @@ void OutriggerEditor::resized()
     sysexDevLabel.setBounds (dev.removeFromLeft (110));
     sysexDev.setBounds (dev.removeFromLeft (110));
 
-    sd.removeFromTop (12);
+    sd.removeFromTop (10);
     routeLabel.setBounds (sd.removeFromTop (20));
     auto rt = sd.removeFromTop (24);
     routeBox.setBounds (rt.removeFromLeft (rt.getWidth() / 2 - 3));
     rt.removeFromLeft (6);
     focusBox.setBounds (rt);
     sd.removeFromTop (4);
-    clockBtn.setBounds (sd.removeFromTop (22));
+    for (auto* b : { &moduleBtn, &clockBtn, &followBtn, &thruBtn }) b->setBounds (sd.removeFromTop (22));
 }
 
 void OutriggerEditor::layoutDetail (juce::Rectangle<int> a)
@@ -533,6 +750,7 @@ void OutriggerEditor::layoutDetail (juce::Rectangle<int> a)
     auto bankCol = row1.removeFromLeft (120);
     bankLabel.setBounds (bankCol.removeFromTop (16));
     bank.setBounds (bankCol.removeFromTop (24));
+    bankName.setBounds (bankCol.removeFromTop (18));
     for (auto* k : { &expr, &cutoff, &reso, &atk, &dec, &rel }) { k->setBounds (row1.removeFromLeft (kw)); row1.removeFromLeft (4); }
 
     if (selectedPart == kRhythmPart)
@@ -557,12 +775,45 @@ void OutriggerEditor::layoutDetail (juce::Rectangle<int> a)
     }
 }
 
+void OutriggerEditor::updateWarnings()
+{
+    juce::String w;
+    const auto nowMs = juce::Time::getMillisecondCounter();
+    if (! proc.processingRuns())
+        w = "Host isn't processing audio: MIDI and the return are paused";
+    else if (! proc.hostGivesAudioInput())
+        w = OutriggerProcessor::isEffectVariant() ? "This slot gets no audio input from the host"
+                                                  : "No audio input in this slot: try Outrigger FX in an effect slot";
+    else if (lastNoteMs != 0 && nowMs - lastNoteMs > 600 && nowMs - lastNoteMs < 4000 && returnPeakSinceNote < 0.0005f)
+        w = "Notes sent but no return audio: check the interface input";
+    else if (clockBtn.getToggleState() && ! proc.hostGivesTransport())
+        w = "Host sends no tempo or transport, so MIDI clock is idle";
+    warning.setText (w, juce::dontSendNotification);
+    warning.setColour (juce::Label::textColourId, lnf.theme().meterHigh);
+}
+
 void OutriggerEditor::timerCallback()
 {
     meter.set (proc.meterPeak (0), proc.meterPeak (1), proc.meterRms (0), proc.meterRms (1), proc.takeClip());
 
     const auto act = proc.takeActivity();
-    for (int i = 0; i < strips.size(); ++i) strips[i]->setActivity ((act >> i) & 1u);
+    const auto unitAct = proc.takeUnitInputActivity();
+    for (int i = 0; i < strips.size(); ++i) strips[i]->setActivity ((act >> i) & 1u, (unitAct >> i) & 1u);
+
+    const auto nowMs = juce::Time::getMillisecondCounter();
+    if (act != 0) { lastNoteMs = nowMs; returnPeakSinceNote = 0.0f; }
+    returnPeakSinceNote = juce::jmax (returnPeakSinceNote, proc.meterPeak (0), proc.meterPeak (1));
+
+    if (++slowTick % 15 == 0)    // twice a second: names (bank may have changed) and module-mode layout
+    {
+        for (auto* s : strips) s->refreshName();
+        if (selectedPart != kRhythmPart)
+        {
+            const int prog = (int) proc.apvts.getRawParameterValue (paramId (selectedPart, "prog"))->load() + 1;
+            bankName.setText (names.tone ((int) bank.getValue(), prog), juce::dontSendNotification);
+        }
+        if (page1.isVisible() != (proc.activeParts() > kNormalParts)) resized();
+    }
 
     const double sr = proc.getSampleRate() > 0 ? proc.getSampleRate() : 48000.0;
     const auto st = proc.latencyState();
@@ -578,15 +829,20 @@ void OutriggerEditor::timerCallback()
     juce::String latText = "Latency: " + juce::String (proc.getHardwareLatency()) + " samples";
     if (measuring) latText = "Measuring... (listening on return)";
     else if (st == LatencyProbe::State::TimedOut) latText << "  (last measure: no signal)";
+    else if (st == LatencyProbe::State::Done)
+        latText << "  (" << proc.lastMeasurePings() << " hits, spread " << juce::String (1000.0 * proc.lastMeasureSpread() / sr, 1) << " ms)";
     latencyLabel.setText (latText, juce::dontSendNotification);
 
     juce::String status;
     const auto mode = proc.getOutputMode();
-    if (mode == OutputMode::Host) status = "Sending through the host's MIDI output";
-    else if (proc.getDirectDeviceId().isEmpty()) status = "Pick a MIDI device for direct output";
-    else status = proc.isDirectConnected() ? "Direct device connected" : "Device not available: rescan or reconnect";
+    if (mode == OutputMode::Host) status = "MIDI out: through the host";
+    else if (proc.getDirectDeviceId().isEmpty()) status = "Pick the MIDI port the unit is connected to";
+    else status = proc.isDirectConnected() ? "MIDI out: device connected" : "MIDI out device not available: rescan or reconnect";
+    if (proc.getUnitInputId().isNotEmpty())
+        status << (proc.isUnitInputConnected() ? "  |  MIDI in: connected" : "  |  MIDI in: not available");
     if (proc.syncPending()) status << "  |  sending settings...";
     deviceStatus.setText (status, juce::dontSendNotification);
     deviceStatus.setColour (juce::Label::textColourId, lnf.theme().textDim);
+    updateWarnings();
 }
 } // namespace outrigger

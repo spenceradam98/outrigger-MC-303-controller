@@ -89,7 +89,8 @@ public:
 
     // Desired state in, messages out at offset 0. Notes are not budgeted (router handles them).
     // Returns the number of bytes emitted.
-    int process (const std::array<PartState, kNumParts>& parts, const GlobalState& g, int numSamples, EventList& out);
+    int process (const std::array<PartState, kNumParts>& parts, const GlobalState& g, int numSamples, EventList& out,
+                 int numActiveParts = kNormalParts);
 
     bool pending() const { return lastWasPartial; }
     double budget() const { return tokens; }

@@ -115,7 +115,8 @@ int Sync::emitField (EventList& out, int ch, Field f, int value, int bank, bool 
     return 0;
 }
 
-int Sync::process (const std::array<PartState, kNumParts>& parts, const GlobalState& g, int numSamples, EventList& out)
+int Sync::process (const std::array<PartState, kNumParts>& parts, const GlobalState& g, int numSamples, EventList& out,
+                   int numActiveParts)
 {
     tokens = std::min (burst, tokens + rate * numSamples / sr);
     int emitted = 0;
@@ -141,7 +142,7 @@ int Sync::process (const std::array<PartState, kNumParts>& parts, const GlobalSt
     for (int fi = 0; fi < kNumFields; ++fi)
     {
         const auto f = (Field) fi;
-        for (int p = 0; p < kNumParts; ++p)
+        for (int p = 0; p < std::clamp (numActiveParts, 1, kNumParts); ++p)
         {
             const auto& ps = parts[(size_t) p];
             if (! ps.enabled) continue;

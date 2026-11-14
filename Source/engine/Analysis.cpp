@@ -34,49 +34,97 @@ void Meter::process (const float* const* ch, int numChannels, int numSamples)
     }
 }
 
+void LatencyProbe::start (int channel, int note, int pings)
+{
+    ch = channel & 15;
+    nt = note & 127;
+    pingsWanted = std::clamp (pings, 1, kMaxPings);
+    pingsDone = numResults = 0;
+    state = State::Waiting;
+    phase = Phase::Quiet;
+    noiseFloor = 0.0f;
+    elapsed = 0;
+    phaseEnd = (int64_t) (0.05 * sr);      // 50 ms of noise-floor measurement first
+}
+
+void LatencyProbe::finish()
+{
+    if (numResults == 0) { state = State::TimedOut; return; }
+    std::sort (results, results + numResults);
+    result = results[numResults / 2];
+    spread = results[numResults - 1] - results[0];
+    state = State::Done;
+}
+
 void LatencyProbe::process (const float* const* in, int numChannels, int numSamples, EventList& out)
 {
-    if (state != State::Waiting)
-    {
-        if (noteOffPending && elapsed >= noteOffAt) { out.add3 (0, (uint8_t) (0x80 | ch), (uint8_t) nt, 0); noteOffPending = false; }
-        elapsed += numSamples;
-        return;
-    }
+    // Note-off for the last ping, wherever we are.
+    if (noteOffAt >= 0 && elapsed >= noteOffAt) { out.add3 (0, (uint8_t) (0x80 | ch), (uint8_t) nt, 0); noteOffAt = -1; }
 
-    if (sendPending)
-    {
-        // Measure the noise floor in the block before the hit, then fire at offset 0 of the next one.
-        float nf = 0.0f;
-        for (int c = 0; c < numChannels; ++c)
-            for (int i = 0; i < numSamples; ++i) nf = std::max (nf, std::fabs (in[c][i]));
-        noiseFloor = nf;
-        sendPending = false;
-        elapsed = -1;               // the hit goes out at the start of the next block
-        return;
-    }
+    if (state != State::Waiting) { elapsed += numSamples; return; }
 
-    if (elapsed < 0)
-    {
-        out.add3 (0, (uint8_t) (0x90 | ch), (uint8_t) nt, 120);
-        elapsed = 0;
-        noteOffPending = true;
-        noteOffAt = (int64_t) (0.1 * sr);
-    }
-
-    const float thr = std::max (threshold, noiseFloor * 4.0f);
-    for (int i = 0; i < numSamples; ++i)
-    {
+    auto blockPeak = [&] (int from) {
         float a = 0.0f;
-        for (int c = 0; c < numChannels; ++c) a = std::max (a, std::fabs (in[c][i]));
-        if (a > thr)
+        for (int c = 0; c < numChannels; ++c)
+            for (int i = from; i < numSamples; ++i) a = std::max (a, std::fabs (in[c][i]));
+        return a;
+    };
+
+    switch (phase)
+    {
+        case Phase::Quiet:
+            noiseFloor = std::max (noiseFloor, blockPeak (0));
+            if (elapsed + numSamples >= phaseEnd) phase = Phase::Armed;   // fire at the start of the next block
+            break;
+
+        case Phase::Armed:
         {
-            result = (int) (elapsed + i);
-            state = State::Done;
+            out.add3 (0, (uint8_t) (0x90 | ch), (uint8_t) nt, 120);
+            noteOffAt = elapsed + (int64_t) (0.1 * sr);
+            phase = Phase::Listening;
+            phaseEnd = elapsed + (int64_t) sr;     // 1 s timeout per ping
+            const int64_t sentAt = elapsed;
+            // Listen in this same block too.
+            const float thr = std::max (threshold, noiseFloor * 4.0f);
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float a = 0.0f;
+                for (int c = 0; c < numChannels; ++c) a = std::max (a, std::fabs (in[c][i]));
+                if (a > thr) { results[numResults++] = (int) (elapsed + i - sentAt); phase = Phase::Gap; break; }
+            }
+            if (phase == Phase::Gap) { ++pingsDone; phaseEnd = elapsed + (int64_t) (0.4 * sr); }
+            pingSentAt = sentAt;
+            break;
+        }
+
+        case Phase::Listening:
+        {
+            const float thr = std::max (threshold, noiseFloor * 4.0f);
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float a = 0.0f;
+                for (int c = 0; c < numChannels; ++c) a = std::max (a, std::fabs (in[c][i]));
+                if (a > thr) { results[numResults++] = (int) (elapsed + i - pingSentAt); phase = Phase::Gap; break; }
+            }
+            if (phase == Phase::Gap) { ++pingsDone; phaseEnd = elapsed + (int64_t) (0.4 * sr); }
+            else if (elapsed + numSamples >= phaseEnd) { ++pingsDone; phase = Phase::Gap; phaseEnd = elapsed + (int64_t) (0.1 * sr); }
+            break;
+        }
+
+        case Phase::Gap:
+        {
+            // Let the hit ring out until the return is quiet again, then go again (or finish).
+            const float thr = std::max (threshold, noiseFloor * 4.0f);
+            if (blockPeak (0) > thr * 0.5f && elapsed < phaseEnd + (int64_t) (3.0 * sr))
+                break;
+            if (elapsed + numSamples >= phaseEnd)
+            {
+                if (pingsDone >= pingsWanted) finish();
+                else phase = Phase::Armed;
+            }
             break;
         }
     }
-    if (noteOffPending && elapsed >= noteOffAt) { out.add3 (0, (uint8_t) (0x80 | ch), (uint8_t) nt, 0); noteOffPending = false; }
     elapsed += numSamples;
-    if (state == State::Waiting && elapsed > (int64_t) sr) state = State::TimedOut;
 }
 } // namespace outrigger

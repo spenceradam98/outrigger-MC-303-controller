@@ -5,11 +5,29 @@
 
 #include <juce_audio_utils/juce_audio_utils.h>
 
+#include <map>
+
 namespace outrigger
 {
 using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
 using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
 using ComboAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
+
+// Tone and rhythm-set names, loaded from CSV files the user keeps in Documents/Outrigger.
+// tones.csv: bank,program,name   rhythm.csv: program,name   (program numbers 1-128 as on the unit)
+class NameTable
+{
+public:
+    static juce::File folder();
+    void load();
+    void writeTemplatesIfMissing() const;
+    juce::String tone (int bank, int program1) const { return tones[{ bank, program1 }]; }
+    juce::String rhythm (int program1) const { return rhythms[{ -1, program1 }]; }
+    int count() const { return (int) (tones.size() + rhythms.size()); }
+
+private:
+    mutable std::map<std::pair<int, int>, juce::String> tones, rhythms;
+};
 
 // A labelled rotary knob.
 struct Knob : public juce::Component
@@ -37,16 +55,20 @@ private:
 class PartStrip : public juce::Component
 {
 public:
-    PartStrip (OutriggerProcessor&, int part, std::function<void (int)> onSelect);
+    PartStrip (OutriggerProcessor&, int part, std::function<void (int)> onSelect, const NameTable& names);
     void resized() override;
     void paint (juce::Graphics&) override;
     void setSelected (bool s) { selected = s; repaint(); }
-    void setActivity (bool a);
+    void setActivity (bool a, bool fromUnit);
+    void refreshName();
 
 private:
+    OutriggerProcessor& proc;
+    const NameTable& names;
+    juce::Label nameLabel;
     int part;
     bool selected = false;
-    float led = 0.0f;
+    float led = 0.0f, unitLed = 0.0f;
     juce::TextButton select;
     juce::ToggleButton on { "On" };
     juce::Slider channel, program;
@@ -75,6 +97,10 @@ private:
     void refreshDevices();
     void loadDrumNote();
     void layoutDetail (juce::Rectangle<int> area);
+    void refreshSetups();
+    void saveSetup();
+    void setPage (int page);
+    void updateWarnings();
 
     OutriggerProcessor& proc;
     ThemedLookAndFeel lnf;
@@ -84,8 +110,19 @@ private:
     juce::Label title, subtitle;
     juce::ComboBox themeBox, outputModeBox, deviceBox;
     juce::TextButton rescan { "Rescan" }, sendAll { "Send All" }, panic { "Panic" };
-    juce::Label deviceStatus;
-    juce::StringArray deviceIds;
+    juce::Label deviceStatus, warning;
+    juce::StringArray deviceIds, inputIds;
+    juce::ComboBox inputBox, setupBox;
+    juce::TextButton saveSetupBtn { "Save setup" }, namesBtn { "Names" };
+    juce::Array<juce::File> setupFiles;
+    std::unique_ptr<juce::FileChooser> chooser;
+    NameTable names;
+    juce::Label bankName;
+    juce::TextButton page1 { "Parts R, 1-7" }, page2 { "Parts 8-16" };
+    int page = 0;
+    uint32_t lastNoteMs = 0;
+    int slowTick = 0;
+    float returnPeakSinceNote = 0.0f;
 
     // mixer
     juce::OwnedArray<PartStrip> strips;
@@ -122,11 +159,12 @@ private:
     std::unique_ptr<ComboAttachment> revTypeA, choTypeA, routeA, focusA;
     Knob revLevel { "Rev Level" }, choLevel { "Cho Level" };
     juce::ToggleButton experimental { "GS level SysEx (experimental)" }, clockBtn { "Send MIDI clock" };
-    std::unique_ptr<ButtonAttachment> clockA;
+    juce::ToggleButton moduleBtn { "Sound Module mode (16 parts)" }, followBtn { "Follow unit knobs" }, thruBtn { "Unit MIDI to host" };
+    std::unique_ptr<ButtonAttachment> clockA, moduleA, followA, thruA;
     juce::Slider sysexDev;
     juce::Label sysexDevLabel, fxLabel, routeLabel, returnLabel;
 
-    juce::Rectangle<int> mixerArea, detailArea, sideArea, headerArea;
+    juce::Rectangle<int> mixerArea, detailArea, sideArea, headerArea, footerArea;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OutriggerEditor)
 };

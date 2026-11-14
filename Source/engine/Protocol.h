@@ -51,9 +51,13 @@ namespace sysex
     constexpr uint8_t ChorusLevel[4] = { 0x00, 0x40, 0x01, 0x3A };
 }
 
-constexpr int kNumParts = 8;          // index 0 = rhythm part R, 1..7 = parts 1..7
+// Normal mode: 8 parts (R + 1..7). Sound Module mode: 16 parts, rhythm on part 10.
+// Index 0 = rhythm part (ch 10), 1..9 = parts 1..9 (ch 1..9), 10..15 = parts 11..16 (ch 11..16).
+constexpr int kNumParts = 16;
+constexpr int kNormalParts = 8;
 constexpr int kRhythmPart = 0;
-constexpr int defaultChannelForPart (int part) { return part == kRhythmPart ? 9 : part - 1; } // 0-based channel
+constexpr int defaultChannelForPart (int part) { return part == kRhythmPart ? 9 : (part <= 9 ? part - 1 : part); } // 0-based
+constexpr int displayNumberForPart (int part) { return part == kRhythmPart ? 10 : (part <= 9 ? part : part + 1); }
 
 constexpr const char* kReverbTypes[8] = { "Room 1", "Room 2", "Room 3", "Hall 1", "Hall 2", "Plate", "Delay", "Pan Delay" };
 constexpr const char* kChorusTypes[8] = { "Chorus 1", "Chorus 2", "Chorus 3", "Chorus 4", "FB Chorus", "Flanger", "Short Delay", "Short Delay FB" };

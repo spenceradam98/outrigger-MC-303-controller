@@ -3,7 +3,7 @@
 
 namespace outrigger
 {
-juce::String partName (int part) { return part == kRhythmPart ? juce::String ("R") : juce::String (part); }
+juce::String partName (int part) { return part == kRhythmPart ? juce::String ("R") : juce::String (displayNumberForPart (part)); }
 juce::String paramId (int part, const char* suffix) { return "p" + juce::String (part) + "_" + suffix; }
 
 static juce::String offsetText (float v, int) { const int i = juce::roundToInt (v); return i > 0 ? "+" + juce::String (i) : juce::String (i); }
@@ -55,6 +55,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout OutriggerProcessor::createLa
     for (int p = 0; p < kNumParts; ++p) partNames.add ("Part " + partName (p));
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "focus", 1 }, "Focus Part", partNames, 1));
     layout.add (std::make_unique<AudioParameterBool> (ParameterID { "clock", 1 }, "Send MIDI Clock", false));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { "module_mode", 1 }, "Sound Module Mode (16 parts)", false));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { "unit_follow", 1 }, "Follow Unit Knobs", true));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { "unit_thru", 1 }, "Unit MIDI To Host", false));
     return layout;
 }
 
@@ -83,7 +86,11 @@ OutriggerProcessor::OutriggerProcessor()
     routeMode = apvts.getRawParameterValue ("route");
     focusPart = apvts.getRawParameterValue ("focus");
     clockOn = apvts.getRawParameterValue ("clock");
+    moduleMode = apvts.getRawParameterValue ("module_mode");
+    unitFollow = apvts.getRawParameterValue ("unit_follow");
+    unitThru = apvts.getRawParameterValue ("unit_thru");
     clearDrumEdits();
+    startTimerHz (30);
 }
 
 void OutriggerProcessor::clearDrumEdits()
@@ -147,14 +154,24 @@ void OutriggerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     Router::Config rc;
     rc.mode = routeMode->load() > 0.5f ? RouteMode::FocusPart : RouteMode::Passthrough;
     rc.focusPart = (int) focusPart->load();
+    rc.numParts = activeParts();
     for (int p = 0; p < kNumParts; ++p) { rc.channel[(size_t) p] = parts[(size_t) p].channel; rc.enabled[(size_t) p] = parts[(size_t) p].enabled; }
     router.configure (rc, events);
 
     if (panicFlag.exchange (false)) router.panic (events);
     if (sendAllFlag.exchange (false)) sync.invalidateAll();
 
+    lastProcessMs = juce::Time::getMillisecondCounter();
+    hostInput = getTotalNumInputChannels() > 0;
+
     for (const auto meta : midi)
         router.route (meta.data, meta.numBytes, meta.samplePosition, events);
+
+    // MIDI from the unit, forwarded to the host (so it can be recorded) when enabled.
+    UnitSink::Msg um;
+    const bool thru = unitThru->load() > 0.5f;
+    while (unitSink->audio.pop (um))
+        if (thru) hostOnly.add (0, um.bytes, um.size);
 
     // Transport -> MIDI clock
     if (clockOn->load() > 0.5f)
@@ -163,6 +180,7 @@ void OutriggerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         if (auto* ph = getPlayHead())
             if (auto pos = ph->getPosition())
             {
+                hostTransport = pos->getBpm().hasValue();
                 t.valid = pos->getPpqPosition().hasValue() && pos->getBpm().hasValue();
                 t.playing = pos->getIsPlaying();
                 t.ppq = pos->getPpqPosition().orFallback (0.0);
@@ -178,7 +196,7 @@ void OutriggerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         clockWasOn = false;
     }
 
-    sync.process (parts, global, n, events);
+    sync.process (parts, global, n, events, activeParts());
     syncBusy = sync.pending();
 
     // ---- return audio ----
@@ -208,10 +226,15 @@ void OutriggerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     for (int c = 0; c < 2; ++c) { peaks[(size_t) c] = meterIn.peak (c); rmsVals[(size_t) c] = meterIn.rms (c); }
     if (meterIn.clipped()) { clipFlag = true; meterIn.resetClip(); }
 
-    if (pingFlag.exchange (false)) probe.start (parts[(size_t) kRhythmPart].channel, pingNote.load());
+    if (pingFlag.exchange (false)) probe.start (parts[(size_t) kRhythmPart].channel, pingNote.load(), 3);
     probe.process (buffer.getArrayOfReadPointers(), chans, n, events);
+    if (probe.getState() == LatencyProbe::State::Done)
+    {
+        probeResult = probe.resultSamples();
+        probeSpread = probe.spreadSamples();
+        probePings = probe.successfulPings();
+    }
     probeState = (int) probe.getState();
-    if (probe.getState() == LatencyProbe::State::Done) probeResult = probe.resultSamples();
 
     if (monitor->load() > 0.5f)
     {
@@ -235,6 +258,8 @@ void OutriggerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     const auto mode = getOutputMode();
     if (mode != OutputMode::Direct)
         for (const auto& e : events) midi.addEvent (e.bytes, e.size, e.offset);
+    for (const auto& e : hostOnly) midi.addEvent (e.bytes, e.size, e.offset);
+    hostOnly.clear();
     if (mode != OutputMode::Host && ! isNonRealtime())
     {
         // Schedule one block ahead so offsets inside the block keep their spacing.
@@ -271,6 +296,116 @@ bool OutriggerProcessor::setDirectDevice (const juce::String& identifier)
     return port != nullptr || identifier.isEmpty();
 }
 
+bool OutriggerProcessor::setUnitInputDevice (const juce::String& identifier)
+{
+    if (inPort != nullptr) inPort->removeSink (unitSink);
+    unitInputId = identifier;
+    inPort = hub->acquireInput (identifier);
+    if (inPort != nullptr) inPort->addSink (unitSink);
+    return inPort != nullptr || identifier.isEmpty();
+}
+
+OutriggerProcessor::~OutriggerProcessor()
+{
+    stopTimer();
+    if (inPort != nullptr) inPort->removeSink (unitSink);
+}
+
+void OutriggerProcessor::timerCallback()
+{
+    if (pendingDevices.exchange (false))
+    {
+        juce::String out, in;
+        {
+            const juce::SpinLock::ScopedLockType sl (pendingLock);
+            out = pendingDirectId;
+            in = pendingInputId;
+        }
+        setDirectDevice (out);
+        setUnitInputDevice (in);
+    }
+
+    // Knob moves and program changes made on the unit itself.
+    std::array<int, kNumParts> channels {};
+    for (int p = 0; p < kNumParts; ++p) channels[(size_t) p] = juce::jlimit (0, 15, (int) pp[(size_t) p].channel->load() - 1);
+    unitParser.setParts (channels, activeParts());
+    const bool follow = unitFollow->load() > 0.5f;
+    UnitSink::Msg m;
+    while (unitSink->message.pop (m))
+    {
+        ParamChange c;
+        if (! unitParser.parse (m.bytes, m.size, c) || c.part < 0) continue;
+        unitInActivity |= 1u << c.part;
+        if (! follow) continue;
+        auto setParam = [this] (const juce::String& id, int value) {
+            if (auto* prm = dynamic_cast<juce::RangedAudioParameter*> (apvts.getParameter (id)))
+                prm->setValueNotifyingHost (prm->convertTo0to1 ((float) value));
+        };
+        setParam (paramId (c.part, kFields[(int) c.field].id), c.value);
+        if (c.field == Field::Program && c.bank >= 0) setParam (paramId (c.part, "bank"), c.bank);
+    }
+}
+
+// ---- setups ----
+static bool isSetupParam (const juce::String& id)
+{
+    return (id.startsWithChar ('p') && id.length() > 1 && juce::CharacterFunctions::isDigit (id[1]))
+        || id == "rev_type" || id == "cho_type" || id == "rev_level" || id == "cho_level" || id == "module_mode";
+}
+
+juce::ValueTree OutriggerProcessor::createSetup() const
+{
+    juce::ValueTree setup ("OutriggerSetup");
+    setup.setProperty ("version", 1, nullptr);
+    for (auto* prm : getParameters())
+        if (auto* r = dynamic_cast<juce::RangedAudioParameter*> (prm); r != nullptr && isSetupParam (r->getParameterID()))
+        {
+            juce::ValueTree v ("Param");
+            v.setProperty ("id", r->getParameterID(), nullptr);
+            v.setProperty ("value", r->convertFrom0to1 (r->getValue()), nullptr);
+            setup.appendChild (v, nullptr);
+        }
+    juce::String drumText;
+    for (int note = 0; note < 128; ++note)
+        for (int k = 0; k < kDrumParams; ++k)
+            if (const int v = drum[(size_t) note][(size_t) k].load(); v >= 0)
+                drumText << note << ":" << k << ":" << v << " ";
+    setup.setProperty ("drum", drumText.trim(), nullptr);
+    return setup;
+}
+
+static void parseDrumText (OutriggerProcessor& p, const juce::String& text)
+{
+    p.clearDrumEdits();
+    for (auto& tok : juce::StringArray::fromTokens (text, " ", ""))
+    {
+        auto f = juce::StringArray::fromTokens (tok, ":", "");
+        if (f.size() == 3)
+            p.setDrum (juce::jlimit (0, 127, f[0].getIntValue()), juce::jlimit (0, kDrumParams - 1, f[1].getIntValue()),
+                       juce::jlimit (0, 127, f[2].getIntValue()));
+    }
+}
+
+void OutriggerProcessor::applySetup (const juce::ValueTree& setup)
+{
+    if (! setup.hasType ("OutriggerSetup")) return;
+    for (auto v : setup)
+        if (auto* r = dynamic_cast<juce::RangedAudioParameter*> (apvts.getParameter (v.getProperty ("id").toString())))
+            if (isSetupParam (r->getParameterID()))
+                r->setValueNotifyingHost (r->convertTo0to1 ((float) (double) v.getProperty ("value")));
+    parseDrumText (*this, setup.getProperty ("drum").toString());
+    sendAllFlag = true;
+}
+
+// ---- host state ----
+static juce::String findDevice (const juce::Array<juce::MidiDeviceInfo>& devices, juce::String id, const juce::String& name)
+{
+    for (auto& d : devices) if (d.identifier == id) return id;
+    if (name.isNotEmpty())
+        for (auto& d : devices) if (d.name == name) return d.identifier;   // the OS renumbered the port
+    return id;    // kept even if absent, so it reconnects when the device returns
+}
+
 void OutriggerProcessor::getStateInformation (juce::MemoryBlock& dest)
 {
     auto state = apvts.copyState();
@@ -278,16 +413,13 @@ void OutriggerProcessor::getStateInformation (juce::MemoryBlock& dest)
     settings.setProperty ("outputMode", outputMode.load(), nullptr);
     settings.setProperty ("deviceId", directDeviceId, nullptr);
     if (auto p = sender.getPort()) settings.setProperty ("deviceName", p->name, nullptr);
+    settings.setProperty ("inputId", unitInputId, nullptr);
+    if (inPort != nullptr) settings.setProperty ("inputName", inPort->name, nullptr);
     settings.setProperty ("sysexDevice", sysexDeviceId.load(), nullptr);
     settings.setProperty ("experimental", experimentalSysex.load(), nullptr);
     settings.setProperty ("theme", themeIndex.load(), nullptr);
     settings.setProperty ("latency", hardwareLatency.load(), nullptr);
-    juce::String drumText;
-    for (int note = 0; note < 128; ++note)
-        for (int k = 0; k < kDrumParams; ++k)
-            if (const int v = drum[(size_t) note][(size_t) k].load(); v >= 0)
-                drumText << note << ":" << k << ":" << v << " ";
-    settings.setProperty ("drum", drumText.trim(), nullptr);
+    settings.setProperty ("drum", createSetup().getProperty ("drum"), nullptr);
 
     state.removeChild (state.getChildWithName ("Settings"), nullptr);
     state.appendChild (settings, nullptr);
@@ -308,25 +440,26 @@ void OutriggerProcessor::setStateInformation (const void* data, int size)
         sysexDeviceId = (int) settings.getProperty ("sysexDevice", 0x10);
         experimentalSysex = (bool) settings.getProperty ("experimental", false);
         themeIndex = (int) settings.getProperty ("theme", 0);
-        clearDrumEdits();
-        for (auto& tok : juce::StringArray::fromTokens (settings.getProperty ("drum").toString(), " ", ""))
+        parseDrumText (*this, settings.getProperty ("drum").toString());
+        setHardwareLatency ((int) settings.getProperty ("latency", 0));
+
+        const auto out = findDevice (juce::MidiOutput::getAvailableDevices(), settings.getProperty ("deviceId").toString(),
+                                     settings.getProperty ("deviceName").toString());
+        const auto in = findDevice (juce::MidiInput::getAvailableDevices(), settings.getProperty ("inputId").toString(),
+                                    settings.getProperty ("inputName").toString());
+        if (juce::MessageManager::existsAndIsCurrentThread())
         {
-            auto parts3 = juce::StringArray::fromTokens (tok, ":", "");
-            if (parts3.size() == 3)
-                setDrum (juce::jlimit (0, 127, parts3[0].getIntValue()), juce::jlimit (0, kDrumParams - 1, parts3[1].getIntValue()),
-                         juce::jlimit (0, 127, parts3[2].getIntValue()));
+            setDirectDevice (out);
+            setUnitInputDevice (in);
         }
-        const int lat = (int) settings.getProperty ("latency", 0);
-        // Reconnect by identifier, or by name if the OS renumbered the port.
-        auto id = settings.getProperty ("deviceId").toString();
-        const auto name = settings.getProperty ("deviceName").toString();
-        bool found = false;
-        for (auto& d : juce::MidiOutput::getAvailableDevices()) if (d.identifier == id) found = true;
-        if (! found && name.isNotEmpty())
-            for (auto& d : juce::MidiOutput::getAvailableDevices()) if (d.name == name) { id = d.identifier; found = true; break; }
-        // Hosts restore state on the message thread, where opening a MIDI port is safe.
-        setDirectDevice (id);    // kept even if absent, so it reconnects when the device returns
-        setHardwareLatency (lat);
+        else
+        {
+            // Some hosts restore state off the message thread: open the ports from the timer instead.
+            const juce::SpinLock::ScopedLockType sl (pendingLock);
+            pendingDirectId = out;
+            pendingInputId = in;
+            pendingDevices = true;
+        }
     }
     sendAllFlag = true;
 }

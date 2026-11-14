@@ -18,7 +18,8 @@ add_library(outrigger_engine STATIC
     Source/engine/Sync.cpp
     Source/engine/Router.cpp
     Source/engine/Clock.cpp
-    Source/engine/Analysis.cpp)
+    Source/engine/Analysis.cpp
+    Source/engine/UnitInput.cpp)
 target_include_directories(outrigger_engine PUBLIC Source/engine)
 set_target_properties(outrigger_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -48,6 +49,31 @@ else()
     FetchContent_MakeAvailable(JUCE)
 endif()
 
+set(OUTRIGGER_SOURCES
+    Source/plugin/PluginProcessor.cpp
+    Source/plugin/PluginEditor.cpp
+    Source/plugin/MidiOutHub.cpp
+    Source/plugin/Theme.cpp)
+
+function(outrigger_setup target fx)
+    target_sources(${target} PRIVATE ${OUTRIGGER_SOURCES})
+    target_compile_definitions(${target} PUBLIC
+        OUTRIGGER_FX=${fx}
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_VST3_CAN_REPLACE_VST2=0
+        JUCE_DISPLAY_SPLASH_SCREEN=0)
+    target_link_libraries(${target}
+        PRIVATE
+            outrigger_engine
+            juce::juce_audio_utils
+        PUBLIC
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_lto_flags
+            juce::juce_recommended_warning_flags)
+endfunction()
+
+# Instrument version: goes in an instrument slot, receives the return on its input bus.
 juce_add_plugin(Outrigger
     COMPANY_NAME "OutriggerAudio"
     PLUGIN_MANUFACTURER_CODE Otrg
@@ -61,27 +87,26 @@ juce_add_plugin(Outrigger
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
     COPY_PLUGIN_AFTER_BUILD FALSE
     VST3_CATEGORIES Instrument External)
+outrigger_setup(Outrigger 0)
 
-target_sources(Outrigger PRIVATE
-    Source/plugin/PluginProcessor.cpp
-    Source/plugin/PluginEditor.cpp
-    Source/plugin/MidiOutHub.cpp
-    Source/plugin/Theme.cpp)
-
-target_compile_definitions(Outrigger PUBLIC
-    JUCE_WEB_BROWSER=0
-    JUCE_USE_CURL=0
-    JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0)
-
-target_link_libraries(Outrigger
-    PRIVATE
-        outrigger_engine
-        juce::juce_audio_utils
-    PUBLIC
-        juce::juce_recommended_config_flags
-        juce::juce_recommended_lto_flags
-        juce::juce_recommended_warning_flags)
+# Effect version: same plugin for hosts that only pass audio input to effect slots.
+option(OUTRIGGER_BUILD_FX "Build the effect-slot variant (Outrigger FX)" ON)
+if(OUTRIGGER_BUILD_FX)
+    juce_add_plugin(OutriggerFX
+        COMPANY_NAME "OutriggerAudio"
+        PLUGIN_MANUFACTURER_CODE Otrg
+        PLUGIN_CODE Otr2
+        FORMATS VST3
+        PRODUCT_NAME "Outrigger FX"
+        IS_SYNTH FALSE
+        NEEDS_MIDI_INPUT TRUE
+        NEEDS_MIDI_OUTPUT TRUE
+        IS_MIDI_EFFECT FALSE
+        EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+        COPY_PLUGIN_AFTER_BUILD FALSE
+        VST3_CATEGORIES Fx External)
+    outrigger_setup(OutriggerFX 1)
+endif()
 
 # ---- UI snapshot tool (renders the editor to PNG; used for docs, not shipped) ----
 option(OUTRIGGER_BUILD_SNAPSHOT "Build the UI snapshot tool" OFF)
@@ -93,6 +118,7 @@ if(OUTRIGGER_BUILD_SNAPSHOT)
         Source/plugin/PluginEditor.cpp
         Source/plugin/MidiOutHub.cpp
         Source/plugin/Theme.cpp)
-    target_compile_definitions(OutriggerSnapshot PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_compile_definitions(OutriggerSnapshot PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 OUTRIGGER_FX=0
+        JucePlugin_Name="Outrigger" JUCE_PLUGINHOST_VST3=1)
     target_link_libraries(OutriggerSnapshot PRIVATE outrigger_engine juce::juce_audio_utils juce::juce_recommended_config_flags)
 endif()

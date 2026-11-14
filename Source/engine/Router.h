@@ -22,6 +22,7 @@ public:
     {
         RouteMode mode = RouteMode::Passthrough;
         int focusPart = 1;
+        int numParts = kNormalParts;               // 8 normal, 16 in Sound Module mode
         std::array<int, kNumParts> channel {};     // 0-based
         std::array<bool, kNumParts> enabled {};
         Config() { for (int p = 0; p < kNumParts; ++p) { channel[(size_t) p] = defaultChannelForPart (p); enabled[(size_t) p] = true; } }
@@ -43,6 +44,7 @@ public:
 
     // Bit p set if part p received a note-on since the last call.
     uint32_t takeActivity() { auto a = activity; activity = 0; return a; }
+    int numParts() const { return cfg.numParts; }
     int heldCount() const;
 
 private:

@@ -3,6 +3,7 @@
 #include "Clock.h"
 #include "Router.h"
 #include "Sync.h"
+#include "UnitInput.h"
 
 #include <cmath>
 #include <cstdio>
@@ -174,26 +175,44 @@ int main()
         CHECK (countStatus (l, 0xFC) == 1);
     }
 
-    // 11. Latency probe: simulated hardware returns the hit 300 samples later.
+    // 11. Latency probe: simulated hardware answers each hit 300 samples later with a decaying burst.
     {
         LatencyProbe p; p.prepare (48000.0);
-        p.start (9, 37);
-        const int delay = 300 + 256;    // hit goes out at the start of the second block
+        p.start (9, 37, 3);
         std::vector<float> buf (256);
+        std::vector<int64_t> hits;
         int64_t pos = 0;
-        bool noteOn = false;
-        for (int b = 0; b < 20 && p.getState() == LatencyProbe::State::Waiting; ++b)
+        int noteOns = 0;
+        for (int b = 0; b < 2000 && p.getState() == LatencyProbe::State::Waiting; ++b)
         {
-            for (int i = 0; i < 256; ++i) buf[(size_t) i] = (pos + i >= delay) ? 0.5f : 0.001f;
+            for (int i = 0; i < 256; ++i)
+            {
+                float v = 0.001f;
+                for (auto h : hits)
+                    if (pos + i >= h + 300 && pos + i < h + 300 + 4000) v += 0.6f * std::exp (-(float) (pos + i - h - 300) / 600.0f);
+                buf[(size_t) i] = v;
+            }
             const float* chans[1] { buf.data() };
             EventList l;
             p.process (chans, 1, 256, l);
-            if (has3 (l, 0x99, 37, 120)) noteOn = true;
+            for (auto& e : l) if (e.size == 3 && e.bytes[0] == 0x99 && e.bytes[2] > 0) { ++noteOns; hits.push_back (pos + e.offset); }
             pos += 256;
         }
-        CHECK (noteOn);
+        CHECK (noteOns == 3);
         CHECK (p.getState() == LatencyProbe::State::Done);
+        CHECK (p.successfulPings() == 3);
         CHECK (p.resultSamples() == 300);
+        CHECK (p.spreadSamples() == 0);
+    }
+
+    // 11b. Latency probe with no return signal times out.
+    {
+        LatencyProbe p; p.prepare (48000.0);
+        p.start (9, 37, 2);
+        std::vector<float> buf (256, 0.0f);
+        const float* chans[1] { buf.data() };
+        for (int b = 0; b < 2000 && p.getState() == LatencyProbe::State::Waiting; ++b) { EventList l; p.process (chans, 1, 256, l); }
+        CHECK (p.getState() == LatencyProbe::State::TimedOut);
     }
 
     // 12. Meter.
@@ -204,6 +223,52 @@ int main()
         m.process (chans, 1, 4800);
         CHECK (std::fabs (m.peak (0) - 0.5f) < 0.01f && std::fabs (m.peak (1) - 0.5f) < 0.01f);
         CHECK (m.rms (0) > 0.05f && ! m.clipped());
+    }
+
+    // 13. Sound Module mode: 16 parts, part 16 on channel 16, part 11 on channel 11.
+    {
+        CHECK (defaultChannelForPart (0) == 9 && defaultChannelForPart (9) == 8 && defaultChannelForPart (10) == 10 && defaultChannelForPart (15) == 15);
+        CHECK (displayNumberForPart (15) == 16 && displayNumberForPart (0) == 10);
+        Sync s; s.prepare (48000.0, 1000000, 1000000);
+        auto parts = defaultParts();
+        GlobalState g;
+        EventList l;
+        s.process (parts, g, 512, l, kNormalParts);
+        CHECK (countStatus (l, 0xCF) == 0);
+        l.clear();
+        s.process (parts, g, 512, l, kNumParts);
+        CHECK (countStatus (l, 0xCF) == 1 && countStatus (l, 0xCA) == 1);
+
+        Router r; Router::Config c; c.numParts = kNumParts;
+        l.clear();
+        r.configure (c, l);
+        const uint8_t on[3] { 0x9F, 60, 90 };
+        r.route (on, 3, 0, l);
+        CHECK ((r.takeActivity() & (1u << 15)) != 0);
+    }
+
+    // 14. Unit input: CC, NRPN, RPN and program changes map back to part parameters.
+    {
+        UnitInput u;
+        std::array<int, kNumParts> ch {};
+        for (int p = 0; p < kNumParts; ++p) ch[(size_t) p] = defaultChannelForPart (p);
+        u.setParts (ch, kNormalParts);
+        ParamChange c;
+        const uint8_t vol[3] { 0xB2, 7, 90 };
+        CHECK (u.parse (vol, 3, c) && c.part == 3 && c.field == Field::Volume && c.value == 90);
+        const uint8_t n1[3] { 0xB0, 99, 1 }, n2[3] { 0xB0, 98, 0x20 }, n3[3] { 0xB0, 6, 100 };
+        CHECK (! u.parse (n1, 3, c) && ! u.parse (n2, 3, c));
+        CHECK (u.parse (n3, 3, c) && c.part == 1 && c.field == Field::Cutoff && c.value == 36);
+        const uint8_t r1[3] { 0xB0, 101, 0 }, r2[3] { 0xB0, 100, 0 }, r3[3] { 0xB0, 6, 12 };
+        u.parse (r1, 3, c); u.parse (r2, 3, c);
+        CHECK (u.parse (r3, 3, c) && c.field == Field::BendRange && c.value == 12);
+        const uint8_t bk[3] { 0xB1, 0, 65 }, pc[2] { 0xC1, 57 };
+        u.parse (bk, 3, c);
+        CHECK (u.parse (pc, 2, c) && c.part == 2 && c.field == Field::Program && c.value == 57 && c.bank == 65);
+        const uint8_t rpc[2] { 0xC9, 40 };
+        CHECK (u.parse (rpc, 2, c) && c.part == 0 && c.bank == -1);
+        const uint8_t other[3] { 0xBC, 7, 1 };     // channel 13 is not a part in normal mode
+        CHECK (! u.parse (other, 3, c));
     }
 
     if (failures == 0) std::printf ("All engine tests passed\n");

@@ -5,6 +5,7 @@
 #include "MidiOutHub.h"
 #include "Router.h"
 #include "Sync.h"
+#include "UnitInput.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -15,11 +16,11 @@ enum class OutputMode { Host = 0, Direct, Both };
 juce::String partName (int part);     // "R", "1".."7"
 juce::String paramId (int part, const char* suffix);
 
-class OutriggerProcessor : public juce::AudioProcessor
+class OutriggerProcessor : public juce::AudioProcessor, private juce::Timer
 {
 public:
     OutriggerProcessor();
-    ~OutriggerProcessor() override = default;
+    ~OutriggerProcessor() override;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
@@ -30,7 +31,8 @@ public:
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override { return "Outrigger"; }
+    const juce::String getName() const override { return JucePlugin_Name; }
+    static constexpr bool isEffectVariant() { return OUTRIGGER_FX != 0; }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return true; }
     bool isMidiEffect() const override { return false; }
@@ -50,7 +52,9 @@ public:
     // ---- message-thread controls ----
     void requestSendAll() { sendAllFlag = true; }
     void requestPanic() { panicFlag = true; }
-    void startLatencyMeasure (int note) { pingNote = note; pingFlag = true; }
+    void startLatencyMeasure (int note) { pingNote = note; pingFlag = true; probeState = (int) LatencyProbe::State::Waiting; }
+    int lastMeasureSpread() const { return probeSpread.load(); }
+    int lastMeasurePings() const { return probePings.load(); }
     LatencyProbe::State latencyState() const { return (LatencyProbe::State) probeState.load(); }
     int lastMeasuredLatency() const { return probeResult.load(); }
     void setHardwareLatency (int samples);     // reported to the host for compensation
@@ -61,6 +65,22 @@ public:
     bool setDirectDevice (const juce::String& identifier);   // empty = none
     juce::String getDirectDeviceId() const { return directDeviceId; }
     bool isDirectConnected() const { return sender.hasPort(); }
+
+    // MIDI coming back from the unit.
+    bool setUnitInputDevice (const juce::String& identifier);   // empty = none
+    juce::String getUnitInputId() const { return unitInputId; }
+    bool isUnitInputConnected() const { return inPort != nullptr; }
+    uint32_t takeUnitInputActivity() { return unitInActivity.exchange (0); }
+
+    // What the host gives us (shown in the UI so setup problems are obvious).
+    bool hostGivesAudioInput() const { return hostInput.load(); }
+    bool hostGivesTransport() const { return hostTransport.load(); }
+    bool processingRuns() const { return juce::Time::getMillisecondCounter() - lastProcessMs.load() < 1000; }
+    int activeParts() const { return moduleMode->load() > 0.5f ? kNumParts : kNormalParts; }
+
+    // Whole-setup presets (part settings, effects, drum edits; not device or return settings).
+    juce::ValueTree createSetup() const;
+    void applySetup (const juce::ValueTree& setup);
 
     void setDeviceId (int id) { sysexDeviceId = juce::jlimit (0, 31, id); }
     int getDeviceId() const { return sysexDeviceId.load(); }
@@ -85,6 +105,7 @@ public:
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
+    void timerCallback() override;      // message thread: applies parameter moves made on the unit
     void readParameters();
 
     // parameter pointers
@@ -102,6 +123,7 @@ private:
     std::atomic<float>* monitor = nullptr; std::atomic<float>* monoSum = nullptr;
     std::atomic<float>* routeMode = nullptr; std::atomic<float>* focusPart = nullptr;
     std::atomic<float>* clockOn = nullptr;
+    std::atomic<float>* moduleMode = nullptr; std::atomic<float>* unitThru = nullptr; std::atomic<float>* unitFollow = nullptr;
 
     // engine (audio thread)
     Sync sync;
@@ -109,7 +131,7 @@ private:
     Clock clock;
     LatencyProbe probe;
     Meter meterIn;
-    EventList events;
+    EventList events, hostOnly;
     std::array<PartState, kNumParts> parts;
     GlobalState global;
     bool clockWasOn = false;
@@ -118,7 +140,9 @@ private:
     // cross-thread
     std::atomic<bool> sendAllFlag { true }, panicFlag { false }, pingFlag { false };
     std::atomic<int> pingNote { 37 };
-    std::atomic<int> probeState { 0 }, probeResult { 0 }, hardwareLatency { 0 };
+    std::atomic<int> probeState { 0 }, probeResult { 0 }, probeSpread { 0 }, probePings { 0 }, hardwareLatency { 0 };
+    std::atomic<bool> hostInput { true }, hostTransport { false };
+    std::atomic<uint32_t> lastProcessMs { 0 }, unitInActivity { 0 };
     std::atomic<int> outputMode { (int) OutputMode::Direct };
     std::atomic<int> sysexDeviceId { 0x10 };
     std::atomic<bool> experimentalSysex { false };
@@ -130,7 +154,13 @@ private:
 
     juce::SharedResourcePointer<MidiOutHub> hub;
     MidiSender sender;
-    juce::String directDeviceId;
+    juce::String directDeviceId, unitInputId;
+    juce::SpinLock pendingLock;
+    juce::String pendingDirectId, pendingInputId;
+    std::atomic<bool> pendingDevices { false };
+    std::shared_ptr<MidiOutHub::InPort> inPort;
+    std::shared_ptr<UnitSink> unitSink = std::make_shared<UnitSink>();
+    UnitInput unitParser;     // message thread only
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OutriggerProcessor)
 };

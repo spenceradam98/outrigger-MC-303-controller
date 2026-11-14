@@ -1,10 +1,12 @@
 #include "Router.h"
 
+#include <algorithm>
+
 namespace outrigger
 {
 int Router::partForChannel (int ch) const
 {
-    for (int p = 0; p < kNumParts; ++p)
+    for (int p = 0; p < cfg.numParts; ++p)
         if (cfg.channel[(size_t) p] == ch) return p;
     return -1;
 }
@@ -18,7 +20,7 @@ int Router::heldCount() const
 
 void Router::configure (const Config& c, EventList& out)
 {
-    bool changed = c.mode != cfg.mode || c.focusPart != cfg.focusPart;
+    bool changed = c.mode != cfg.mode || c.focusPart != cfg.focusPart || c.numParts != cfg.numParts;
     for (int p = 0; p < kNumParts; ++p)
         changed = changed || c.channel[(size_t) p] != cfg.channel[(size_t) p] || c.enabled[(size_t) p] != cfg.enabled[(size_t) p];
     if (changed) releaseAll (out, 0);
@@ -31,7 +33,7 @@ void Router::route (const uint8_t* data, int size, int offset, EventList& out)
 
     const int type = data[0] & 0xF0;
     const int inCh = data[0] & 0x0F;
-    int part = cfg.mode == RouteMode::FocusPart ? cfg.focusPart : partForChannel (inCh);
+    int part = cfg.mode == RouteMode::FocusPart ? std::min (cfg.focusPart, cfg.numParts - 1) : partForChannel (inCh);
     int outCh = inCh;
 
     if (part >= 0)
@@ -76,7 +78,7 @@ void Router::releaseAll (EventList& out, int offset)
 void Router::panic (EventList& out, int offset)
 {
     releaseAll (out, offset);
-    for (int p = 0; p < kNumParts; ++p)
+    for (int p = 0; p < cfg.numParts; ++p)
     {
         const auto st = (uint8_t) (0xB0 | cfg.channel[(size_t) p]);
         out.add3 (offset, st, cc::Hold, 0);
